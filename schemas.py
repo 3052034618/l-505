@@ -610,3 +610,119 @@ class NotificationResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class EventBusinessType(str):
+    pass
+
+
+class EventLogResponse(BaseModel):
+    id: int
+    event_no: str
+    business_type: str
+    event_type: str
+    business_id: int
+    business_no: Optional[str] = None
+    lab_id: Optional[int] = None
+    operator_id: Optional[int] = None
+    target_role: Optional[str] = None
+    target_user_id: Optional[int] = None
+    title: str
+    summary: Optional[str] = None
+    handle_status: str
+    detail_url: Optional[str] = None
+    extra_data: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AuditTrailResponse(BaseModel):
+    id: int
+    business_type: str
+    business_id: int
+    business_no: Optional[str] = None
+    action: str
+    stage_name: Optional[str] = None
+    from_status: Optional[str] = None
+    to_status: Optional[str] = None
+    operator_id: Optional[int] = None
+    operator_name: Optional[str] = None
+    operator_role: Optional[str] = None
+    comment: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    extra_data: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AlarmTaskProgressCreate(BaseModel):
+    progress_status: str
+    progress_percent: int = 0
+    description: Optional[str] = None
+    evidence_url: Optional[str] = None
+
+
+class AlarmTaskProgressResponse(BaseModel):
+    id: int
+    task_id: int
+    operator_id: Optional[int] = None
+    operator_name: Optional[str] = None
+    progress_status: str
+    progress_percent: int
+    description: Optional[str] = None
+    evidence_url: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AlarmClosureCreate(BaseModel):
+    root_cause: str
+    handling_summary: str
+    lessons_learned: Optional[str] = None
+    improvement_actions: Optional[List[str]] = None
+    effectiveness_rating: Optional[int] = None
+
+
+class AlarmClosureResponse(BaseModel):
+    id: int
+    alarm_id: int
+    closed_by_id: Optional[int] = None
+    closed_by_name: Optional[str] = None
+    root_cause: str
+    handling_summary: str
+    lessons_learned: Optional[str] = None
+    improvement_actions: Optional[List[Any]] = None
+    effectiveness_rating: Optional[int] = None
+    verified_by_id: Optional[int] = None
+    verified_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UsageRequestDetailResponse(UsageRequestResponse):
+    audit_trails: List[AuditTrailResponse] = []
+
+
+class ReplenishmentDetailResponse(ReplenishmentResponse):
+    audit_trails: List[AuditTrailResponse] = []
+
+
+class WasteRecordDetailResponse(WasteRecordResponse):
+    audit_trails: List[AuditTrailResponse] = []
+
+
+class AlarmDetailResponse(AlarmResponse):
+    closure: Optional[AlarmClosureResponse] = None
+    audit_trails: List[AuditTrailResponse] = []
+
+
+class AlarmTaskDetailResponse(AlarmTaskResponse):
+    progress_updates: List[AlarmTaskProgressResponse] = []

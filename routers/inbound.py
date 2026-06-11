@@ -9,6 +9,7 @@ import models
 import schemas
 
 from routers.websocket import dispatch_ws_event
+from event_service import event_service
 
 router_inbound = APIRouter(prefix="/api/inbound", tags=["危化品入库"])
 
@@ -193,6 +194,8 @@ def create_inbound(
         admin_notified=False,
         created_at=datetime.utcnow()
     )
+    db.add(record)
+    db.flush()
 
     if msds_result.verified and cabinet_result.allocated:
         existing_inventory = db.query(models.Inventory).filter(
@@ -262,6 +265,39 @@ def create_inbound(
             lab_id=chemical.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.RESEARCHER, models.UserRole.SUPERVISOR]
         )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.INBOUND,
+            business_id=record.id,
+            business_no=inbound_in.batch_no,
+            action="入库审核通过并上架",
+            stage_name="MSDS审核+柜位分配→入库成功",
+            from_status="pending",
+            to_status="approved",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=f"柜位: {cabinet_result.cabinet_no}，MSDS验证通过，存储条件匹配",
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.INBOUND,
+            event_type="approved",
+            business_id=record.id,
+            business_no=inbound_in.batch_no,
+            title=f"化学品入库成功: {chemical.name} {inbound_in.quantity}{inbound_in.unit}",
+            summary=f"柜位: {cabinet_result.cabinet_no} | 批次号: {inbound_in.batch_no}",
+            lab_id=chemical.lab_id,
+            operator_id=current_user.id,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/inbound/{record.id}",
+            extra_data={
+                "chemical_name": chemical.name,
+                "cabinet_no": cabinet_result.cabinet_no,
+                "inventory_id": record.inventory_id,
+            },
+            emit_ws=False,
+        )
     else:
         admin_ids = [u.id for u in db.query(models.User).filter(
             models.User.role.in_([models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER]),
@@ -291,8 +327,36 @@ def create_inbound(
             lab_id=chemical.lab_id,
             roles=[models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
         )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.INBOUND,
+            business_id=record.id,
+            business_no=inbound_in.batch_no,
+            action="入库审核拒绝",
+            stage_name="MSDS审核+柜位分配→拒绝",
+            from_status="pending",
+            to_status="rejected",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=record.reject_reason,
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.INBOUND,
+            event_type="rejected",
+            business_id=record.id,
+            business_no=inbound_in.batch_no,
+            title=f"化学品入库被拒绝: {chemical.name}",
+            summary=f"原因: {record.reject_reason}",
+            lab_id=chemical.lab_id,
+            operator_id=current_user.id,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/inbound/{record.id}",
+            extra_data={"reject_reason": record.reject_reason, "msds_verified": record.msds_verified},
+            emit_ws=False,
+        )
 
-    db.add(record)
     db.commit()
     db.refresh(record)
 

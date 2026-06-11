@@ -170,12 +170,32 @@ async def websocket_endpoint(
         manager.disconnect(user_id, lab_id, role)
 
 
+_detail_url_map = {
+    "inbound": "/inbound/{id}",
+    "usage": "/usage/{id}",
+    "waste": "/waste/{id}",
+    "replenishment": "/replenishment/{id}",
+    "alarm": "/alarm/{id}",
+    "event": "/events/{id}",
+    "system": "/system",
+}
+
 async def push_notification(notification_type: str, event: str, data: dict, user_ids: Optional[List[int]] = None, lab_id: Optional[int] = None, roles: Optional[List[str]] = None):
+    enriched = dict(data) if data else {}
+    if "business_type" not in enriched:
+        enriched["business_type"] = notification_type
+    if "timestamp" not in enriched:
+        enriched["timestamp"] = datetime.utcnow().isoformat()
+    if "business_id" in enriched and "detail_url" not in enriched:
+        tmpl = _detail_url_map.get(notification_type)
+        if tmpl:
+            enriched["detail_url"] = tmpl.format(id=enriched["business_id"])
+
     message = {
         "type": notification_type,
         "event": event,
-        "timestamp": datetime.utcnow().isoformat(),
-        "data": data
+        "timestamp": enriched.get("timestamp", datetime.utcnow().isoformat()),
+        "data": enriched
     }
 
     if user_ids:

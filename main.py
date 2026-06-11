@@ -18,6 +18,7 @@ from routers.alarm import router_sensors, router_alarms, router_plans
 from routers.waste import router_waste, router_disposal, router_replenishment
 from routers.report import router_report, router_notification, generate_all_daily_reports
 from routers.websocket import router_ws
+from routers.events import router_events, router_audits
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -203,3 +204,5 @@ app.include_router(router_replenishment)
 app.include_router(router_report)
 app.include_router(router_notification)
 app.include_router(router_ws)
+app.include_router(router_events)
+app.include_router(router_audits)

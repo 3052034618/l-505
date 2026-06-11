@@ -10,6 +10,7 @@ import schemas
 
 from routers.waste import auto_generate_single_replenishment
 from routers.websocket import dispatch_ws_event
+from event_service import event_service
 
 router_usage = APIRouter(prefix="/api/usage", tags=["领用申请"])
 
@@ -312,6 +313,37 @@ def create_usage_request(
             lab_id=request_in.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
         )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            business_id=request.id,
+            business_no=request_no,
+            action="系统自动审核通过",
+            stage_name="自动审核",
+            from_status="pending",
+            to_status="completed",
+            operator_id=None,
+            operator_name="系统",
+            operator_role="system",
+            comment=f"资质有效、权限充足、用量正常。扣库存{request_in.requested_quantity}{request_in.unit}",
+            extra_data={"auto_passed": True, "deduct_qty": request_in.requested_quantity},
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            event_type="completed",
+            business_id=request.id,
+            business_no=request_no,
+            title=f"领用申请已完成: {chemical.name} {request_in.requested_quantity}{request_in.unit}",
+            summary=f"申请人: {current_user.real_name} | 项目: {request_in.project_name or request_in.project_type.value}",
+            lab_id=request_in.lab_id,
+            operator_id=current_user.id,
+            target_user_id=current_user.id,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/usage/{request.id}",
+            extra_data={"requested_quantity": request_in.requested_quantity, "chemical_name": chemical.name},
+            emit_ws=False,
+        )
 
     elif status_val == models.RequestStatus.SUPERVISOR_PENDING:
         supervisors = db.query(models.User).filter(
@@ -351,6 +383,37 @@ def create_usage_request(
             lab_id=request_in.lab_id,
             roles=[models.UserRole.SUPERVISOR, models.UserRole.LAB_MANAGER]
         )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            business_id=request.id,
+            business_no=request_no,
+            action="提交导师审批",
+            stage_name="自动审核->导师审批",
+            from_status="pending",
+            to_status="supervisor_pending",
+            operator_id=None,
+            operator_name="系统",
+            operator_role="system",
+            comment=block_reason or deviation_result.message,
+            extra_data={"needs_supervisor": True},
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            event_type="supervisor_pending",
+            business_id=request.id,
+            business_no=request_no,
+            title=f"领用申请待导师审批: {chemical.name}",
+            summary=f"申请人: {current_user.real_name} | 原因: {block_reason or deviation_result.message}",
+            lab_id=request_in.lab_id,
+            operator_id=current_user.id,
+            target_role=models.UserRole.SUPERVISOR.value,
+            handle_status=models.EventHandleStatus.PENDING,
+            detail_url=f"/usage/{request.id}",
+            extra_data={"chemical_name": chemical.name, "requester_name": current_user.real_name},
+            emit_ws=False,
+        )
     else:
         notification_service.create_notification(
             db=db,
@@ -380,6 +443,37 @@ def create_usage_request(
             user_ids=[current_user.id],
             lab_id=request_in.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
+        )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            business_id=request.id,
+            business_no=request_no,
+            action="系统自动拦截拒绝",
+            stage_name="自动审核",
+            from_status="pending",
+            to_status="auto_rejected",
+            operator_id=None,
+            operator_name="系统",
+            operator_role="system",
+            comment=block_reason or "系统自动拦截",
+            extra_data={"hard_rejected": True},
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            event_type="auto_rejected",
+            business_id=request.id,
+            business_no=request_no,
+            title=f"领用申请被拦截: {chemical.name}",
+            summary=f"申请人: {current_user.real_name} | 原因: {block_reason or '系统自动拦截'}",
+            lab_id=request_in.lab_id,
+            operator_id=current_user.id,
+            target_user_id=current_user.id,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/usage/{request.id}",
+            extra_data={"chemical_name": chemical.name, "alternative_suggestion": alt_suggestion_text},
+            emit_ws=False,
         )
 
     db.commit()
@@ -539,6 +633,41 @@ def review_usage_request(
             lab_id=request.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
         )
+        wait_duration = None
+        if request.created_at and request.supervisor_reviewed_at:
+            wait_duration = (request.supervisor_reviewed_at - request.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="导师审批通过",
+            stage_name="导师审批",
+            from_status="supervisor_pending",
+            to_status="supervisor_approved",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=review_in.comment,
+            duration_seconds=wait_duration,
+            extra_data={"deduct_qty": request.actual_quantity},
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            event_type="supervisor_approved",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"导师已通过领用: {request.chemical.name if request.chemical else ''}",
+            summary=f"审批人: {current_user.real_name} | 申请人: {request.requester.real_name if request.requester else ''} | 数量: {request.requested_quantity}{request.unit}",
+            lab_id=request.lab_id,
+            operator_id=current_user.id,
+            target_user_id=request.requester_id,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/usage/{request.id}",
+            extra_data={"review_comment": review_in.comment},
+            emit_ws=False,
+        )
     else:
         request.status = models.RequestStatus.SUPERVISOR_REJECTED
         notification_service.create_notification(
@@ -570,6 +699,40 @@ def review_usage_request(
             user_ids=[request.requester_id, current_user.id],
             lab_id=request.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
+        )
+        wait_duration = None
+        if request.created_at and request.supervisor_reviewed_at:
+            wait_duration = (request.supervisor_reviewed_at - request.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="导师审批拒绝",
+            stage_name="导师审批",
+            from_status="supervisor_pending",
+            to_status="supervisor_rejected",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=review_in.comment or "未给出具体原因",
+            duration_seconds=wait_duration,
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.USAGE,
+            event_type="supervisor_rejected",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"导师已驳回领用: {request.chemical.name if request.chemical else ''}",
+            summary=f"审批人: {current_user.real_name} | 原因: {review_in.comment or '未给出具体原因'}",
+            lab_id=request.lab_id,
+            operator_id=current_user.id,
+            target_user_id=request.requester_id,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/usage/{request.id}",
+            extra_data={"reject_reason": review_in.comment},
+            emit_ws=False,
         )
 
     db.commit()

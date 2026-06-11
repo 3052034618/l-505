@@ -9,6 +9,7 @@ import models
 import schemas
 
 from routers.websocket import dispatch_ws_event
+from event_service import event_service
 
 router_sensors = APIRouter(prefix="/api/sensors", tags=["传感器管理"])
 router_alarms = APIRouter(prefix="/api/alarms", tags=["告警与应急调度"])
@@ -351,6 +352,45 @@ def trigger_alarm_from_sensor(db: Session, sensor: models.Sensor, value: float, 
         roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER]
     )
 
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        business_id=alarm.id,
+        business_no=alarm.alarm_no,
+        action="告警触发",
+        stage_name=f"传感器异常→{alarm_level.value if hasattr(alarm_level, 'value') else str(alarm_level)}级告警",
+        from_status="none",
+        to_status="triggered",
+        operator_id=None,
+        operator_name="传感器",
+        operator_role="sensor",
+        comment=alarm.description,
+        extra_data={
+            "trigger_value": value,
+            "threshold": sensor.threshold_max or sensor.threshold_min,
+            "tasks_count": len(task_list),
+        },
+    )
+    event_service.log_event(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        event_type="triggered",
+        business_id=alarm.id,
+        business_no=alarm.alarm_no,
+        title=f"【{level_name}】{alarm_type}",
+        summary=alarm.description,
+        lab_id=lab_id,
+        target_role=models.UserRole.EMERGENCY_TEAM.value,
+        handle_status=models.EventHandleStatus.PENDING,
+        detail_url=f"/alarm/{alarm.id}",
+        extra_data={
+            "level": alarm_level.value if hasattr(alarm_level, 'value') else str(alarm_level),
+            "tasks_count": len(task_list),
+            "emergency_plan": plan.name if plan else None,
+        },
+        emit_ws=False,
+    )
+
     return alarm.id
 
 
@@ -514,16 +554,127 @@ def update_alarm(
     if not alarm:
         raise HTTPException(status_code=404, detail="告警不存在")
 
+    old_status = alarm.status.value if hasattr(alarm.status, 'value') else str(alarm.status)
+    status_changed = update_in.status and update_in.status != alarm.status
+
+    stage_map = {
+        "triggered→acknowledged": "告警触发→应急人员已接单确认",
+        "acknowledged→handling": "接单确认→现场处置中",
+        "handling→resolved": "处置中→告警解决",
+        "triggered→handling": "告警触发→直接进入处置",
+        "triggered→resolved": "告警触发→直接解决",
+        "triggered→false_alarm": "告警触发→误报标记",
+        "acknowledged→resolved": "接单确认→告警解决",
+        "handling→false_alarm": "处置中→误报标记",
+    }
+    default_stage = f"{old_status}→{update_in.status.value if hasattr(update_in.status, 'value') else str(update_in.status)}" if status_changed else None
+
     if update_in.status == models.AlarmStatus.ACKNOWLEDGED and alarm.status == models.AlarmStatus.TRIGGERED:
         alarm.acknowledged_at = datetime.utcnow()
-    if update_in.status == models.AlarmStatus.RESOLVED:
+    if update_in.status in [models.AlarmStatus.RESOLVED, models.AlarmStatus.FALSE_ALARM]:
         alarm.resolved_at = datetime.utcnow()
-        alarm.status = update_in.status
 
     if update_in.status:
         alarm.status = update_in.status
     if update_in.resolution_notes:
         alarm.resolution_notes = update_in.resolution_notes
+
+    db.flush()
+
+    if status_changed:
+        new_status_val = update_in.status.value if hasattr(update_in.status, 'value') else str(update_in.status)
+        stage_key = f"{old_status}→{new_status_val}"
+        stage_name = stage_map.get(stage_key, default_stage or stage_key)
+
+        action_names = {
+            "acknowledged": "告警确认",
+            "handling": "开始处置",
+            "resolved": "告警解决",
+            "false_alarm": "标记误报"
+        }
+        action = action_names.get(new_status_val, "状态更新")
+
+        event_status_map = {
+            "acknowledged": models.EventHandleStatus.HANDLING,
+            "handling": models.EventHandleStatus.HANDLING,
+            "resolved": models.EventHandleStatus.COMPLETED,
+            "false_alarm": models.EventHandleStatus.COMPLETED,
+        }
+        ev_handle_status = event_status_map.get(new_status_val, models.EventHandleStatus.HANDLING)
+
+        wait_duration = None
+        if alarm.acknowledged_at and old_status == "triggered" and new_status_val == "acknowledged":
+            wait_duration = int((alarm.acknowledged_at - alarm.triggered_at).total_seconds())
+        elif alarm.resolved_at and new_status_val in ["resolved", "false_alarm"]:
+            wait_duration = int((alarm.resolved_at - alarm.triggered_at).total_seconds())
+
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.ALARM,
+            business_id=alarm.id,
+            business_no=alarm.alarm_no,
+            action=action,
+            stage_name=stage_name,
+            from_status=old_status,
+            to_status=new_status_val,
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+            comment=update_in.resolution_notes,
+            duration_seconds=wait_duration,
+            extra_data={
+                "old_status": old_status,
+                "new_status": new_status_val,
+            }
+        )
+
+        roles_to_notify = [models.UserRole.EMERGENCY_TEAM, models.UserRole.SAFETY_OFFICER]
+        if alarm.level in [models.AlarmLevel.CRITICAL, models.AlarmLevel.EMERGENCY]:
+            roles_to_notify.extend([models.UserRole.ADMIN, models.UserRole.LAB_MANAGER])
+
+        level_names = {
+            models.AlarmLevel.INFO: "提示",
+            models.AlarmLevel.WARNING: "警告",
+            models.AlarmLevel.CRITICAL: "严重",
+            models.AlarmLevel.EMERGENCY: "紧急"
+        }
+        level_name = level_names.get(alarm.level, str(alarm.level))
+
+        dispatch_ws_event(
+            notification_type="alarm",
+            event="status_changed",
+            data={
+                "id": alarm.id,
+                "alarm_no": alarm.alarm_no,
+                "business_no": alarm.alarm_no,
+                "business_type": "alarm",
+                "level": alarm.level.value if hasattr(alarm.level, 'value') else str(alarm.level),
+                "level_name": level_name,
+                "type": alarm.type,
+                "lab_id": alarm.lab_id,
+                "cabinet_id": alarm.cabinet_id,
+                "location": alarm.location,
+                "old_status": old_status,
+                "status": new_status_val,
+                "operator_id": current_user.id,
+                "operator_name": current_user.real_name,
+                "resolution_notes": update_in.resolution_notes,
+            },
+            lab_id=alarm.lab_id,
+            roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER],
+            user_ids=None,
+        )
+
+        event_service.update_event_handle_status(
+            db=db,
+            business_type=models.EventBusinessType.ALARM,
+            business_id=alarm.id,
+            new_handle_status=ev_handle_status,
+            extra_update={
+                "operator_id": current_user.id,
+                "summary": f"{action}: {update_in.resolution_notes or alarm.type}",
+            }
+        )
 
     db.commit()
     db.refresh(alarm)
@@ -543,6 +694,9 @@ def update_alarm_task(
     if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER] and task.assignee_id != current_user.id:
         raise HTTPException(status_code=403, detail="只能处理分配给自己的任务")
 
+    old_status = task.status.value if hasattr(task.status, 'value') else str(task.status)
+    status_changed = update_in.status and update_in.status != task.status
+
     if update_in.status == models.TaskStatus.IN_PROGRESS and task.status == models.TaskStatus.ASSIGNED:
         task.started_at = datetime.utcnow()
     if update_in.status == models.TaskStatus.COMPLETED:
@@ -552,6 +706,96 @@ def update_alarm_task(
         task.status = update_in.status
     if update_in.notes:
         task.notes = update_in.notes
+
+    db.flush()
+
+    if status_changed:
+        alarm = task.alarm
+        new_status_val = update_in.status.value if hasattr(update_in.status, 'value') else str(update_in.status)
+
+        task_stage_map = {
+            "assigned→in_progress": "任务待领取→处置中",
+            "in_progress→completed": "处置中→任务完成",
+            "assigned→completed": "任务待领取→直接完成",
+            "assigned→cancelled": "任务待领取→取消",
+            "in_progress→cancelled": "处置中→取消",
+        }
+        stage_key = f"{old_status}→{new_status_val}"
+        stage_name = task_stage_map.get(stage_key, stage_key)
+
+        task_action_map = {
+            "in_progress": "开始处置任务",
+            "completed": "完成处置任务",
+            "cancelled": "取消处置任务",
+        }
+        action = task_action_map.get(new_status_val, "任务状态更新")
+
+        wait_duration = None
+        if task.started_at and old_status == "assigned" and new_status_val == "in_progress":
+            wait_duration = int((task.started_at - task.assigned_at).total_seconds())
+        elif task.completed_at and new_status_val == "completed":
+            wait_duration = int((task.completed_at - task.assigned_at).total_seconds())
+
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.ALARM,
+            business_id=task.alarm_id,
+            business_no=alarm.alarm_no if alarm else None,
+            action=action,
+            stage_name=f"[{task.task_description[:30]}] {stage_name}",
+            from_status=old_status,
+            to_status=new_status_val,
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+            comment=update_in.notes,
+            duration_seconds=wait_duration,
+            extra_data={
+                "task_id": task.id,
+                "task_desc": task.task_description,
+                "old_status": old_status,
+                "new_status": new_status_val,
+            }
+        )
+
+        roles_to_notify = [models.UserRole.EMERGENCY_TEAM, models.UserRole.SAFETY_OFFICER]
+        if alarm and alarm.level in [models.AlarmLevel.CRITICAL, models.AlarmLevel.EMERGENCY]:
+            roles_to_notify.extend([models.UserRole.ADMIN, models.UserRole.LAB_MANAGER])
+
+        if alarm:
+            level_names = {
+                models.AlarmLevel.INFO: "提示",
+                models.AlarmLevel.WARNING: "警告",
+                models.AlarmLevel.CRITICAL: "严重",
+                models.AlarmLevel.EMERGENCY: "紧急"
+            }
+            level_name = level_names.get(alarm.level, str(alarm.level))
+
+            dispatch_ws_event(
+                notification_type="alarm",
+                event="task_status_changed",
+                data={
+                    "task_id": task.id,
+                    "alarm_id": task.alarm_id,
+                    "alarm_no": alarm.alarm_no,
+                    "business_no": alarm.alarm_no,
+                    "business_type": "alarm",
+                    "level": alarm.level.value if hasattr(alarm.level, 'value') else str(alarm.level),
+                    "level_name": level_name,
+                    "type": alarm.type,
+                    "lab_id": alarm.lab_id,
+                    "location": alarm.location,
+                    "task_description": task.task_description,
+                    "old_status": old_status,
+                    "status": new_status_val,
+                    "operator_id": current_user.id,
+                    "operator_name": current_user.real_name,
+                    "notes": update_in.notes,
+                },
+                lab_id=alarm.lab_id,
+                roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER],
+                user_ids=[task.assignee_id] if task.assignee_id else None,
+            )
 
     db.commit()
     db.refresh(task)
@@ -601,6 +845,497 @@ def get_my_alarm_tasks(
             completed_at=t.completed_at
         ) for t in tasks
     ]
+
+
+@router_alarms.post("/tasks/{task_id}/accept", response_model=schemas.AlarmTaskResponse)
+def accept_alarm_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    task = db.query(models.AlarmTask).filter(models.AlarmTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if task.status not in [models.TaskStatus.ASSIGNED]:
+        raise HTTPException(status_code=400, detail=f"当前任务状态为{task.status.value if hasattr(task.status, 'value') else str(task.status)}，无法接单")
+
+    if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER, models.UserRole.EMERGENCY_TEAM]:
+        raise HTTPException(status_code=403, detail="没有权限接单")
+    if task.assignee_id and task.assignee_id != current_user.id and current_user.role not in [models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER]:
+        raise HTTPException(status_code=403, detail="该任务已分配给其他人员")
+
+    old_status = task.status.value if hasattr(task.status, 'value') else str(task.status)
+    task.assignee_id = current_user.id
+    task.status = models.TaskStatus.IN_PROGRESS
+    task.started_at = datetime.utcnow()
+
+    alarm = task.alarm
+
+    wait_duration = int((task.started_at - task.assigned_at).total_seconds()) if task.assigned_at else None
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        business_id=task.alarm_id,
+        business_no=alarm.alarm_no if alarm else None,
+        action="应急人员接单",
+        stage_name=f"[{task.task_description[:30]}] 任务待领取→处置中",
+        from_status=old_status,
+        to_status="in_progress",
+        operator_id=current_user.id,
+        operator_name=current_user.real_name,
+        operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+        comment=f"{current_user.real_name}确认接单并开始处置",
+        duration_seconds=wait_duration,
+        extra_data={
+            "task_id": task.id,
+            "task_desc": task.task_description,
+            "action_type": "accept",
+        }
+    )
+
+    if alarm and alarm.status == models.AlarmStatus.TRIGGERED:
+        alarm.status = models.AlarmStatus.HANDLING
+        alarm.acknowledged_at = task.started_at
+        event_service.update_event_handle_status(
+            db=db,
+            business_type=models.EventBusinessType.ALARM,
+            business_id=alarm.id,
+            new_handle_status=models.EventHandleStatus.HANDLING,
+            extra_update={
+                "operator_id": current_user.id,
+                "summary": f"应急人员已接单处置: {task.task_description[:30]}",
+            }
+        )
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.ALARM,
+            business_id=alarm.id,
+            business_no=alarm.alarm_no,
+            action="告警开始处置",
+            stage_name="告警触发→现场处置中",
+            from_status="triggered",
+            to_status="handling",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+            comment=f"{current_user.real_name}接单后自动进入处置状态",
+            duration_seconds=int((alarm.acknowledged_at - alarm.triggered_at).total_seconds()) if alarm.triggered_at else None,
+        )
+
+    db.flush()
+
+    roles_to_notify = [models.UserRole.EMERGENCY_TEAM, models.UserRole.SAFETY_OFFICER]
+    if alarm and alarm.level in [models.AlarmLevel.CRITICAL, models.AlarmLevel.EMERGENCY]:
+        roles_to_notify.extend([models.UserRole.ADMIN, models.UserRole.LAB_MANAGER])
+
+    if alarm:
+        level_names = {
+            models.AlarmLevel.INFO: "提示",
+            models.AlarmLevel.WARNING: "警告",
+            models.AlarmLevel.CRITICAL: "严重",
+            models.AlarmLevel.EMERGENCY: "紧急"
+        }
+        level_name = level_names.get(alarm.level, str(alarm.level))
+
+        dispatch_ws_event(
+            notification_type="alarm",
+            event="task_accepted",
+            data={
+                "task_id": task.id,
+                "alarm_id": task.alarm_id,
+                "alarm_no": alarm.alarm_no,
+                "business_no": alarm.alarm_no,
+                "business_type": "alarm",
+                "level": alarm.level.value if hasattr(alarm.level, 'value') else str(alarm.level),
+                "level_name": level_name,
+                "type": alarm.type,
+                "lab_id": alarm.lab_id,
+                "location": alarm.location,
+                "alarm_status": alarm.status.value if hasattr(alarm.status, 'value') else str(alarm.status),
+                "task_description": task.task_description,
+                "task_status": "in_progress",
+                "assignee_id": current_user.id,
+                "assignee_name": current_user.real_name,
+                "operator_id": current_user.id,
+                "operator_name": current_user.real_name,
+                "started_at": task.started_at.isoformat() if task.started_at else None,
+            },
+            lab_id=alarm.lab_id,
+            roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER],
+        )
+
+    db.commit()
+    db.refresh(task)
+
+    return schemas.AlarmTaskResponse(
+        id=task.id,
+        alarm_id=task.alarm_id,
+        assignee_id=task.assignee_id,
+        assignee_name=task.assignee.real_name if task.assignee else None,
+        task_description=task.task_description,
+        priority=task.priority,
+        status=task.status,
+        estimated_distance=task.estimated_distance,
+        notes=task.notes,
+        assigned_at=task.assigned_at,
+        started_at=task.started_at,
+        completed_at=task.completed_at
+    )
+
+
+@router_alarms.post("/tasks/{task_id}/progress", response_model=schemas.AlarmTaskProgressResponse)
+def add_task_progress(
+    task_id: int,
+    progress_in: schemas.AlarmTaskProgressCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    task = db.query(models.AlarmTask).filter(models.AlarmTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if current_user.role not in [models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER] and task.assignee_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只能更新分配给自己的任务进度")
+
+    if progress_in.progress_percent < 0 or progress_in.progress_percent > 100:
+        raise HTTPException(status_code=400, detail="进度百分比必须在0-100之间")
+
+    progress = models.AlarmTaskProgress(
+        task_id=task_id,
+        operator_id=current_user.id,
+        operator_name=current_user.real_name,
+        progress_status=progress_in.progress_status,
+        progress_percent=progress_in.progress_percent,
+        description=progress_in.description,
+        evidence_url=progress_in.evidence_url,
+        created_at=datetime.utcnow(),
+    )
+    db.add(progress)
+    db.flush()
+
+    if task.status == models.TaskStatus.ASSIGNED and progress_in.progress_percent > 0:
+        task.status = models.TaskStatus.IN_PROGRESS
+        task.started_at = datetime.utcnow()
+        db.flush()
+
+    if progress_in.progress_percent >= 100 and task.status != models.TaskStatus.COMPLETED:
+        task.status = models.TaskStatus.COMPLETED
+        task.completed_at = datetime.utcnow()
+        db.flush()
+
+    alarm = task.alarm
+
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        business_id=task.alarm_id,
+        business_no=alarm.alarm_no if alarm else None,
+        action="任务进度更新",
+        stage_name=f"[{task.task_description[:30]}] 进度更新至{progress_in.progress_percent}%",
+        from_status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+        to_status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+        operator_id=current_user.id,
+        operator_name=current_user.real_name,
+        operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+        comment=progress_in.description or progress_in.progress_status,
+        extra_data={
+            "task_id": task.id,
+            "progress_id": progress.id,
+            "progress_percent": progress_in.progress_percent,
+            "progress_status": progress_in.progress_status,
+            "evidence_url": progress_in.evidence_url,
+        }
+    )
+
+    roles_to_notify = [models.UserRole.EMERGENCY_TEAM, models.UserRole.SAFETY_OFFICER]
+    if alarm and alarm.level in [models.AlarmLevel.CRITICAL, models.AlarmLevel.EMERGENCY]:
+        roles_to_notify.extend([models.UserRole.ADMIN, models.UserRole.LAB_MANAGER])
+
+    if alarm:
+        level_names = {
+            models.AlarmLevel.INFO: "提示",
+            models.AlarmLevel.WARNING: "警告",
+            models.AlarmLevel.CRITICAL: "严重",
+            models.AlarmLevel.EMERGENCY: "紧急"
+        }
+        level_name = level_names.get(alarm.level, str(alarm.level))
+
+        dispatch_ws_event(
+            notification_type="alarm",
+            event="task_progress",
+            data={
+                "progress_id": progress.id,
+                "task_id": task.id,
+                "alarm_id": task.alarm_id,
+                "alarm_no": alarm.alarm_no,
+                "business_no": alarm.alarm_no,
+                "business_type": "alarm",
+                "level": alarm.level.value if hasattr(alarm.level, 'value') else str(alarm.level),
+                "level_name": level_name,
+                "type": alarm.type,
+                "lab_id": alarm.lab_id,
+                "location": alarm.location,
+                "task_description": task.task_description,
+                "task_status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+                "progress_percent": progress_in.progress_percent,
+                "progress_status": progress_in.progress_status,
+                "description": progress_in.description,
+                "evidence_url": progress_in.evidence_url,
+                "operator_id": current_user.id,
+                "operator_name": current_user.real_name,
+            },
+            lab_id=alarm.lab_id,
+            roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER],
+            user_ids=[task.assignee_id] if task.assignee_id else None,
+        )
+
+    db.commit()
+    db.refresh(progress)
+
+    return schemas.AlarmTaskProgressResponse(
+        id=progress.id,
+        task_id=progress.task_id,
+        operator_id=progress.operator_id,
+        operator_name=progress.operator_name,
+        progress_status=progress.progress_status,
+        progress_percent=progress.progress_percent,
+        description=progress.description,
+        evidence_url=progress.evidence_url,
+        created_at=progress.created_at,
+    )
+
+
+@router_alarms.post("/{alarm_id}/closure", response_model=schemas.AlarmClosureResponse)
+def close_alarm(
+    alarm_id: int,
+    closure_in: schemas.AlarmClosureCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles(models.UserRole.SAFETY_OFFICER, models.UserRole.ADMIN))
+):
+    alarm = db.query(models.Alarm).filter(models.Alarm.id == alarm_id).first()
+    if not alarm:
+        raise HTTPException(status_code=404, detail="告警不存在")
+
+    if alarm.status == models.AlarmStatus.RESOLVED:
+        raise HTTPException(status_code=400, detail="该告警已完成复盘")
+
+    existing_closure = db.query(models.AlarmClosure).filter(models.AlarmClosure.alarm_id == alarm_id).first()
+    if existing_closure:
+        raise HTTPException(status_code=400, detail="该告警已有复盘记录")
+
+    uncompleted_tasks = db.query(models.AlarmTask).filter(
+        models.AlarmTask.alarm_id == alarm_id,
+        models.AlarmTask.status.notin_([models.TaskStatus.COMPLETED, models.TaskStatus.CANCELLED])
+    ).all()
+    if uncompleted_tasks and current_user.role != models.UserRole.ADMIN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"尚有{len(uncompleted_tasks)}个处置任务未完成，完成后再进行复盘"
+        )
+
+    old_status = alarm.status.value if hasattr(alarm.status, 'value') else str(alarm.status)
+    alarm.status = models.AlarmStatus.RESOLVED
+    alarm.resolved_at = datetime.utcnow()
+
+    closure = models.AlarmClosure(
+        alarm_id=alarm_id,
+        closed_by_id=current_user.id,
+        closed_by_name=current_user.real_name,
+        root_cause=closure_in.root_cause,
+        handling_summary=closure_in.handling_summary,
+        lessons_learned=closure_in.lessons_learned,
+        improvement_actions=closure_in.improvement_actions,
+        effectiveness_rating=closure_in.effectiveness_rating,
+        created_at=datetime.utcnow(),
+    )
+    db.add(closure)
+    db.flush()
+
+    wait_duration = int((alarm.resolved_at - alarm.triggered_at).total_seconds()) if alarm.triggered_at and alarm.resolved_at else None
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        business_id=alarm.id,
+        business_no=alarm.alarm_no,
+        action="告警结束复盘",
+        stage_name=f"{old_status}→告警解决(复盘完成)",
+        from_status=old_status,
+        to_status="resolved",
+        operator_id=current_user.id,
+        operator_name=current_user.real_name,
+        operator_role=current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
+        comment=f"根因: {closure_in.root_cause} | 处置总结: {closure_in.handling_summary}",
+        duration_seconds=wait_duration,
+        extra_data={
+            "closure_id": closure.id,
+            "root_cause": closure_in.root_cause,
+            "lessons_learned": closure_in.lessons_learned,
+            "improvement_actions": closure_in.improvement_actions,
+            "effectiveness_rating": closure_in.effectiveness_rating,
+        }
+    )
+
+    event_service.update_event_handle_status(
+        db=db,
+        business_type=models.EventBusinessType.ALARM,
+        business_id=alarm.id,
+        new_handle_status=models.EventHandleStatus.COMPLETED,
+        extra_update={
+            "operator_id": current_user.id,
+            "summary": f"告警复盘完成: 根因={closure_in.root_cause[:40]}",
+        }
+    )
+
+    roles_to_notify = [models.UserRole.EMERGENCY_TEAM, models.UserRole.SAFETY_OFFICER]
+    if alarm.level in [models.AlarmLevel.CRITICAL, models.AlarmLevel.EMERGENCY]:
+        roles_to_notify.extend([models.UserRole.ADMIN, models.UserRole.LAB_MANAGER])
+
+    level_names = {
+        models.AlarmLevel.INFO: "提示",
+        models.AlarmLevel.WARNING: "警告",
+        models.AlarmLevel.CRITICAL: "严重",
+        models.AlarmLevel.EMERGENCY: "紧急"
+    }
+    level_name = level_names.get(alarm.level, str(alarm.level))
+
+    dispatch_ws_event(
+        notification_type="alarm",
+        event="closed",
+        data={
+            "closure_id": closure.id,
+            "alarm_id": alarm.id,
+            "alarm_no": alarm.alarm_no,
+            "business_no": alarm.alarm_no,
+            "business_type": "alarm",
+            "level": alarm.level.value if hasattr(alarm.level, 'value') else str(alarm.level),
+            "level_name": level_name,
+            "type": alarm.type,
+            "lab_id": alarm.lab_id,
+            "location": alarm.location,
+            "status": "resolved",
+            "old_status": old_status,
+            "root_cause": closure_in.root_cause,
+            "handling_summary": closure_in.handling_summary,
+            "lessons_learned": closure_in.lessons_learned,
+            "improvement_actions": closure_in.improvement_actions,
+            "effectiveness_rating": closure_in.effectiveness_rating,
+            "operator_id": current_user.id,
+            "operator_name": current_user.real_name,
+            "resolved_at": alarm.resolved_at.isoformat() if alarm.resolved_at else None,
+        },
+        lab_id=alarm.lab_id,
+        roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER],
+    )
+
+    db.commit()
+    db.refresh(closure)
+
+    return schemas.AlarmClosureResponse(
+        id=closure.id,
+        alarm_id=closure.alarm_id,
+        closed_by_id=closure.closed_by_id,
+        closed_by_name=closure.closed_by_name,
+        root_cause=closure.root_cause,
+        handling_summary=closure.handling_summary,
+        lessons_learned=closure.lessons_learned,
+        improvement_actions=closure.improvement_actions,
+        effectiveness_rating=closure.effectiveness_rating,
+        verified_by_id=closure.verified_by_id,
+        verified_at=closure.verified_at,
+        created_at=closure.created_at,
+    )
+
+
+@router_alarms.get("/tasks/{task_id}/detail", response_model=schemas.AlarmTaskDetailResponse)
+def get_alarm_task_detail(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    task = db.query(models.AlarmTask).filter(models.AlarmTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    progresses = sorted(task.progress_updates, key=lambda p: p.created_at) if task.progress_updates else []
+
+    return schemas.AlarmTaskDetailResponse(
+        id=task.id,
+        alarm_id=task.alarm_id,
+        assignee_id=task.assignee_id,
+        assignee_name=task.assignee.real_name if task.assignee else None,
+        task_description=task.task_description,
+        priority=task.priority,
+        status=task.status,
+        estimated_distance=task.estimated_distance,
+        notes=task.notes,
+        assigned_at=task.assigned_at,
+        started_at=task.started_at,
+        completed_at=task.completed_at,
+        progress_updates=[
+            schemas.AlarmTaskProgressResponse(
+                id=p.id,
+                task_id=p.task_id,
+                operator_id=p.operator_id,
+                operator_name=p.operator_name,
+                progress_status=p.progress_status,
+                progress_percent=p.progress_percent,
+                description=p.description,
+                evidence_url=p.evidence_url,
+                created_at=p.created_at,
+            ) for p in progresses
+        ]
+    )
+
+
+@router_alarms.get("/{alarm_id}/detail", response_model=schemas.AlarmDetailResponse)
+def get_alarm_detail(
+    alarm_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    alarm = db.query(models.Alarm).filter(models.Alarm.id == alarm_id).first()
+    if not alarm:
+        raise HTTPException(status_code=404, detail="告警不存在")
+
+    basic_resp = get_alarm(alarm_id, db, current_user)
+    audit_trails = event_service.get_audit_trails(db, models.EventBusinessType.ALARM, alarm.id)
+
+    return schemas.AlarmDetailResponse(
+        **basic_resp.model_dump(),
+        closure=schemas.AlarmClosureResponse(
+            id=alarm.closure.id,
+            alarm_id=alarm.closure.alarm_id,
+            closed_by_id=alarm.closure.closed_by_id,
+            closed_by_name=alarm.closure.closed_by_name,
+            root_cause=alarm.closure.root_cause,
+            handling_summary=alarm.closure.handling_summary,
+            lessons_learned=alarm.closure.lessons_learned,
+            improvement_actions=alarm.closure.improvement_actions,
+            effectiveness_rating=alarm.closure.effectiveness_rating,
+            verified_by_id=alarm.closure.verified_by_id,
+            verified_at=alarm.closure.verified_at,
+            created_at=alarm.closure.created_at,
+        ) if hasattr(alarm, 'closure') and alarm.closure else None,
+        audit_trails=[
+            schemas.AuditTrailResponse(
+                id=a.id,
+                business_type=a.business_type,
+                business_id=a.business_id,
+                business_no=a.business_no,
+                action=a.action,
+                stage_name=a.stage_name,
+                from_status=a.from_status,
+                to_status=a.to_status,
+                operator_id=a.operator_id,
+                operator_name=a.operator_name,
+                operator_role=a.operator_role,
+                comment=a.comment,
+                duration_seconds=a.duration_seconds,
+                extra_data=a.extra_data,
+                created_at=a.created_at,
+            ) for a in audit_trails
+        ]
+    )
 
 
 router_plans = APIRouter(prefix="/api/emergency-plans", tags=["应急预案"])

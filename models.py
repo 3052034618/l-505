@@ -342,6 +342,7 @@ class Alarm(Base):
     sensor = relationship("Sensor")
     emergency_plan = relationship("EmergencyPlan", back_populates="alarms")
     tasks = relationship("AlarmTask", back_populates="alarm")
+    closure = relationship("AlarmClosure", back_populates="alarm", uselist=False)
 
 
 class EmergencyPlan(Base):
@@ -391,6 +392,7 @@ class AlarmTask(Base):
 
     alarm = relationship("Alarm", back_populates="tasks")
     assignee = relationship("User", back_populates="assigned_alarms")
+    progress_updates = relationship("AlarmTaskProgress", back_populates="task", cascade="all, delete-orphan")
 
 
 class WasteStatus(str, enum.Enum):
@@ -560,3 +562,95 @@ class Notification(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User")
+
+
+class EventBusinessType(str, enum.Enum):
+    INBOUND = "inbound"
+    USAGE = "usage"
+    WASTE = "waste"
+    ALARM = "alarm"
+    REPLENISHMENT = "replenishment"
+    SYSTEM = "system"
+
+
+class EventHandleStatus(str, enum.Enum):
+    PENDING = "pending"
+    HANDLING = "handling"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class EventLog(Base):
+    __tablename__ = "event_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_no = Column(String(50), unique=True, nullable=False, index=True)
+    business_type = Column(Enum(EventBusinessType), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    business_id = Column(Integer, nullable=False)
+    business_no = Column(String(50), index=True)
+    lab_id = Column(Integer, ForeignKey("laboratories.id"))
+    operator_id = Column(Integer, ForeignKey("users.id"))
+    target_role = Column(String(50))
+    target_user_id = Column(Integer, ForeignKey("users.id"))
+    title = Column(String(300), nullable=False)
+    summary = Column(Text)
+    handle_status = Column(Enum(EventHandleStatus), default=EventHandleStatus.PENDING, index=True)
+    detail_url = Column(String(300))
+    extra_data = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AuditTrail(Base):
+    __tablename__ = "audit_trails"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_type = Column(Enum(EventBusinessType), nullable=False, index=True)
+    business_id = Column(Integer, nullable=False, index=True)
+    business_no = Column(String(50))
+    action = Column(String(100), nullable=False)
+    stage_name = Column(String(100))
+    from_status = Column(String(50))
+    to_status = Column(String(50))
+    operator_id = Column(Integer, ForeignKey("users.id"))
+    operator_name = Column(String(100))
+    operator_role = Column(String(50))
+    comment = Column(Text)
+    duration_seconds = Column(Float)
+    extra_data = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AlarmTaskProgress(Base):
+    __tablename__ = "alarm_task_progresses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("alarm_tasks.id"), nullable=False)
+    operator_id = Column(Integer, ForeignKey("users.id"))
+    operator_name = Column(String(100))
+    progress_status = Column(String(50), nullable=False)
+    progress_percent = Column(Integer, default=0)
+    description = Column(Text)
+    evidence_url = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("AlarmTask", back_populates="progress_updates")
+
+
+class AlarmClosure(Base):
+    __tablename__ = "alarm_closures"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alarm_id = Column(Integer, ForeignKey("alarms.id"), nullable=False)
+    closed_by_id = Column(Integer, ForeignKey("users.id"))
+    closed_by_name = Column(String(100))
+    root_cause = Column(Text)
+    handling_summary = Column(Text)
+    lessons_learned = Column(Text)
+    improvement_actions = Column(JSON)
+    effectiveness_rating = Column(Integer)
+    verified_by_id = Column(Integer, ForeignKey("users.id"))
+    verified_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    alarm = relationship("Alarm", back_populates="closure")

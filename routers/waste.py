@@ -6,6 +6,7 @@ from database import get_db
 from auth import get_current_user, require_roles, generate_request_no
 from notification_service import notification_service
 from routers.websocket import dispatch_ws_event
+from event_service import event_service
 import models
 import schemas
 
@@ -223,6 +224,47 @@ def inspect_waste(
             lab_id=waste.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
         )
+        wait_duration = None
+        if waste.created_at and waste.inspected_at:
+            wait_duration = (waste.inspected_at - waste.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            business_id=waste.id,
+            business_no=waste.waste_no,
+            action="废液检查通过→自动生成转运批次",
+            stage_name="安环检查→入批",
+            from_status="pending_inspection",
+            to_status="batched",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=created_batch.batch_no if created_batch else "检查通过，暂无匹配处理中心",
+            duration_seconds=wait_duration,
+            extra_data={
+                "batch_no": created_batch.batch_no if created_batch else None,
+                "disposal_center_id": waste.disposal_center_id,
+            },
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            event_type="inspection_passed",
+            business_id=waste.id,
+            business_no=waste.waste_no,
+            title=f"废液检查通过，已生成转运批次: {created_batch.batch_no if created_batch else '待匹配'}",
+            summary=f"处理中心ID={waste.disposal_center_id} | 废液: {waste.quantity}{waste.unit}",
+            lab_id=waste.lab_id,
+            operator_id=current_user.id,
+            target_user_id=waste.submitter_id,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/waste/{waste.id}",
+            extra_data={
+                "batch_no": created_batch.batch_no if created_batch else None,
+                "chemical_name": waste.chemical.name if waste.chemical else None,
+            },
+            emit_ws=False,
+        )
     else:
         reasons = []
         if not inspection.seal_passed:
@@ -263,6 +305,46 @@ def inspect_waste(
             user_ids=[waste.submitter_id, current_user.id],
             lab_id=waste.lab_id,
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
+        )
+        wait_duration = None
+        if waste.created_at and waste.inspected_at:
+            wait_duration = (waste.inspected_at - waste.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            business_id=waste.id,
+            business_no=waste.waste_no,
+            action="废液检查不合格→退回",
+            stage_name="安环检查→退回",
+            from_status="pending_inspection",
+            to_status="inspection_failed",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=" | ".join(reasons) if reasons else "检查不合格",
+            duration_seconds=wait_duration,
+            extra_data={
+                "seal_passed": inspection.seal_passed,
+                "label_passed": inspection.label_passed,
+                "violation_recorded": inspection.violation_recorded,
+                "violation_type": inspection.violation_type,
+            },
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            event_type="inspection_failed",
+            business_id=waste.id,
+            business_no=waste.waste_no,
+            title=f"废液检查被退回: {waste.chemical.name if waste.chemical else ''}",
+            summary=f"原因: {' | '.join(reasons) if reasons else '检查不合格'}",
+            lab_id=waste.lab_id,
+            operator_id=current_user.id,
+            target_user_id=waste.submitter_id,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/waste/{waste.id}",
+            extra_data={"reject_reasons": reasons, "violation_type": inspection.violation_type},
+            emit_ws=False,
         )
 
     chemical = waste.chemical
@@ -559,6 +641,37 @@ def auto_generate_single_replenishment(db: Session, chemical_id: int, created_by
         related_id=request.id,
         related_type="replenishment"
     )
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.REPLENISHMENT,
+        business_id=request.id,
+        business_no=request_no,
+        action="系统自动生成补货申请",
+        stage_name="自动生成->主任待审",
+        from_status="none",
+        to_status="pending_lab_manager",
+        operator_id=None,
+        operator_name="系统",
+        operator_role="system",
+        comment=f"领用扣减后 {round(current_total,4)}{unit} < 安全水位{round(safety_total,4)}{unit}",
+        extra_data={"auto_generated": True},
+    )
+    event_service.log_event(
+        db=db,
+        business_type=models.EventBusinessType.REPLENISHMENT,
+        event_type="pending_lab_manager",
+        business_id=request.id,
+        business_no=request_no,
+        title=f"补货申请待主任审批: {chemical.name}",
+        summary=f"当前库存: {round(current_total,4)}{unit} < 安全水位: {round(safety_total,4)}{unit}",
+        lab_id=chemical.lab_id,
+        operator_id=created_by_id,
+        target_role=models.UserRole.LAB_MANAGER.value,
+        handle_status=models.EventHandleStatus.PENDING,
+        detail_url=f"/replenishment/{request.id}",
+        extra_data={"chemical_name": chemical.name, "requested_qty": round(suggested_qty, 2)},
+        emit_ws=False,
+    )
     return request
 
 
@@ -774,6 +887,40 @@ def lab_manager_review(
             user_ids=[request.created_by_id, current_user.id],
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
         )
+        wait_duration = None
+        if request.created_at and request.lab_manager_approved_at:
+            wait_duration = (request.lab_manager_approved_at - request.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="主任审批通过",
+            stage_name="主任审批→安环审批",
+            from_status="pending_lab_manager",
+            to_status="pending_safety",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=review_in.comment,
+            duration_seconds=wait_duration,
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            event_type="lab_manager_approved",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"主任已通过补货，待安环: {request.chemical.name if request.chemical else ''}",
+            summary=f"主任: {current_user.real_name} | 申请: {request.requested_quantity}{request.unit}",
+            lab_id=request.chemical.lab_id if request.chemical else None,
+            operator_id=current_user.id,
+            target_role=models.UserRole.SAFETY_OFFICER.value,
+            handle_status=models.EventHandleStatus.HANDLING,
+            detail_url=f"/replenishment/{request.id}",
+            extra_data={"request_no": request.request_no, "review_comment": review_in.comment},
+            emit_ws=False,
+        )
     else:
         request.status = models.ReplenishmentStatus.LAB_MANAGER_REJECTED
         notification_service.create_notification(
@@ -804,6 +951,40 @@ def lab_manager_review(
             },
             user_ids=[request.created_by_id, current_user.id],
             roles=[models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
+        )
+        wait_duration = None
+        if request.created_at and request.lab_manager_approved_at:
+            wait_duration = (request.lab_manager_approved_at - request.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="主任审批拒绝",
+            stage_name="主任审批",
+            from_status="pending_lab_manager",
+            to_status="lab_manager_rejected",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=review_in.comment or "未说明",
+            duration_seconds=wait_duration,
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            event_type="lab_manager_rejected",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"主任已驳回补货: {request.chemical.name if request.chemical else ''}",
+            summary=f"主任: {current_user.real_name} | 原因: {review_in.comment or '未说明'}",
+            lab_id=request.chemical.lab_id if request.chemical else None,
+            operator_id=current_user.id,
+            target_user_id=request.created_by_id,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/replenishment/{request.id}",
+            extra_data={"reject_reason": review_in.comment},
+            emit_ws=False,
         )
 
     db.commit()
@@ -885,6 +1066,42 @@ def safety_officer_review(
             user_ids=[request.created_by_id, current_user.id],
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
         )
+        wait_duration = None
+        if request.lab_manager_approved_at and request.safety_officer_approved_at:
+            wait_duration = (request.safety_officer_approved_at - request.lab_manager_approved_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="安环审批通过+生成采购单",
+            stage_name="安环审批→采购同步",
+            from_status="pending_safety",
+            to_status="synced_to_purchase",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=f"{review_in.comment or ''} 采购单号: {po_no}",
+            duration_seconds=wait_duration,
+            extra_data={"purchase_order_no": po_no},
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            event_type="safety_approved",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"安环已通过补货，采购单号已生成: {po_no}",
+            summary=f"安环: {current_user.real_name} | 采购单号: {po_no} | 补货: {request.requested_quantity}{request.unit}",
+            lab_id=request.chemical.lab_id if request.chemical else None,
+            operator_id=current_user.id,
+            target_user_id=request.created_by_id,
+            target_role=models.UserRole.LAB_MANAGER.value,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/replenishment/{request.id}",
+            extra_data={"purchase_order_no": po_no, "request_no": request.request_no},
+            emit_ws=False,
+        )
     else:
         request.status = models.ReplenishmentStatus.SAFETY_REJECTED
         notification_service.create_notification(
@@ -915,6 +1132,41 @@ def safety_officer_review(
             },
             user_ids=[request.created_by_id, current_user.id],
             roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
+        )
+        wait_duration = None
+        if request.lab_manager_approved_at and request.safety_officer_approved_at:
+            wait_duration = (request.safety_officer_approved_at - request.lab_manager_approved_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            business_id=request.id,
+            business_no=request.request_no,
+            action="安环审批拒绝",
+            stage_name="安环审批",
+            from_status="pending_safety",
+            to_status="safety_rejected",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=review_in.comment or "未说明",
+            duration_seconds=wait_duration,
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.REPLENISHMENT,
+            event_type="safety_rejected",
+            business_id=request.id,
+            business_no=request.request_no,
+            title=f"安环已驳回补货: {request.chemical.name if request.chemical else ''}",
+            summary=f"安环: {current_user.real_name} | 原因: {review_in.comment or '未说明'}",
+            lab_id=request.chemical.lab_id if request.chemical else None,
+            operator_id=current_user.id,
+            target_user_id=request.created_by_id,
+            target_role=models.UserRole.LAB_MANAGER.value,
+            handle_status=models.EventHandleStatus.FAILED,
+            detail_url=f"/replenishment/{request.id}",
+            extra_data={"reject_reason": review_in.comment},
+            emit_ws=False,
         )
 
     db.commit()
