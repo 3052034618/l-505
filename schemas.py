@@ -596,6 +596,82 @@ class DailyReportResponse(BaseModel):
         from_attributes = True
 
 
+# ============ 监管总览看板 ============
+
+class DashboardLinks(BaseModel):
+    usage_supervisor_pending: str
+    replenish_lab_manager_pending: str
+    replenish_safety_pending: str
+    waste_pending_inspection: str
+    active_alarms: str
+    low_stock: str
+    today_inbound: str
+    today_usage: str
+    today_waste: str
+
+
+class DashboardPendingApprovals(BaseModel):
+    usage_supervisor: int
+    replenish_lab_manager: int
+    replenish_safety: int
+    waste_inspection: int
+    total: int
+
+
+class DashboardActiveAlarms(BaseModel):
+    triggered: int
+    handling: int
+    tasks_assigned: int
+    total: int
+
+
+class DashboardInventory(BaseModel):
+    low_stock_items: int
+
+
+class DashboardWasteSummary(BaseModel):
+    pending_inspection: int
+    batched: int
+    in_transit: int
+    submitted_today: int
+
+
+class DashboardTodayStats(BaseModel):
+    date: str
+    inbound_approved: int
+    inbound_total: int
+    usage_approved: int
+    usage_total: int
+    waste_submitted: int
+
+
+class DashboardLabSummary(BaseModel):
+    lab_id: int
+    lab_code: str
+    lab_name: str
+    pending_usage_supervisor: int
+    pending_replenish_lab_manager: int
+    pending_replenish_safety: int
+    pending_waste_inspection: int
+    active_alarms: int
+    low_stock_items: int
+    links: DashboardLinks
+
+
+class DashboardOverviewResponse(BaseModel):
+    generated_at: str
+    scope_lab_ids: List[int]
+    viewer_role: str
+    viewer_id: int
+    viewer_name: str
+    pending_approvals: DashboardPendingApprovals
+    active_alarms: DashboardActiveAlarms
+    inventory: DashboardInventory
+    waste: DashboardWasteSummary
+    today: DashboardTodayStats
+    lab_breakdown: List[DashboardLabSummary]
+
+
 class NotificationResponse(BaseModel):
     id: int
     type: NotificationType

@@ -19,6 +19,7 @@ from routers.waste import router_waste, router_disposal, router_replenishment
 from routers.report import router_report, router_notification, generate_all_daily_reports
 from routers.websocket import router_ws
 from routers.events import router_events, router_audits
+from routers.dashboard import router_dashboard
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,51 +42,17 @@ def run_replenishment_reminder():
     try:
         db = SessionLocal()
         try:
-            pending_statuses = [
-                models.ReplenishmentStatus.PENDING_LAB_MANAGER,
-                models.ReplenishmentStatus.PENDING_SAFETY
-            ]
-            threshold_hours = 24
-            since = datetime.utcnow() - timedelta(hours=threshold_hours)
-
-            pending = db.query(models.ReplenishmentRequest).filter(
-                models.ReplenishmentRequest.status.in_(pending_statuses),
-                models.ReplenishmentRequest.created_at <= since
-            ).all()
-
-            reminded = 0
-            for req in pending:
-                last_sent = req.last_reminder_sent_at
-                if last_sent and (datetime.utcnow() - last_sent).total_seconds() < threshold_hours * 3600:
-                    continue
-
-                role_map = {
-                    models.ReplenishmentStatus.PENDING_LAB_MANAGER: [models.UserRole.LAB_MANAGER],
-                    models.ReplenishmentStatus.PENDING_SAFETY: [models.UserRole.SAFETY_OFFICER]
-                }
-                roles = role_map.get(req.status, [])
-                stage = "实验室主任审批" if req.status == models.ReplenishmentStatus.PENDING_LAB_MANAGER else "安环部门审批"
-
-                from notification_service import notification_service
-                notification_service.create_notification(
-                    db=db,
-                    notification_type=models.NotificationType.REPLENISHMENT,
-                    title=f"【催办】补货申请超时未处理",
-                    content=f"申请单号: {req.request_no}, 当前阶段: {stage}, 请及时处理",
-                    roles=roles,
-                    related_id=req.id,
-                    related_type="replenishment"
+            from reminder_service import process_all_reminders
+            result = process_all_reminders(db)
+            if result.get("total_reminded", 0) > 0:
+                logger.info(
+                    f"[{datetime.now()}] 定时任务：统一催办  reminded={result.get('total_reminded')} "
+                    f"escalated={result.get('total_escalated')}  detail={result.get('detail')}"
                 )
-                req.reminder_sent_count += 1
-                req.last_reminder_sent_at = datetime.utcnow()
-                reminded += 1
-            db.commit()
-            if reminded > 0:
-                logger.info(f"[{datetime.now()}] 定时任务：补货催办 {reminded} 条")
         finally:
             db.close()
     except Exception as e:
-        logger.error(f"补货催办任务出错: {e}")
+        logger.error(f"统一催办任务出错: {e}")
 
 
 @asynccontextmanager
@@ -206,3 +173,4 @@ app.include_router(router_notification)
 app.include_router(router_ws)
 app.include_router(router_events)
 app.include_router(router_audits)
+app.include_router(router_dashboard)

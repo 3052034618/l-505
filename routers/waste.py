@@ -130,6 +130,44 @@ def create_waste_record(
     db.commit()
     db.refresh(record)
 
+    # 事件中心：废液提交→待检查
+    event_service.add_audit_trail(
+        db=db,
+        business_type=models.EventBusinessType.WASTE,
+        business_id=record.id,
+        business_no=waste_no,
+        action="废液提交→待检查",
+        stage_name="提交→安环待检",
+        from_status="none",
+        to_status="pending_inspection",
+        operator_id=current_user.id,
+        operator_name=current_user.real_name,
+        operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+        comment=f"废液类型: {record.waste_type}, 数量: {record.quantity}{record.unit}",
+    )
+    event_service.log_event(
+        db=db,
+        business_type=models.EventBusinessType.WASTE,
+        event_type="submitted",
+        business_id=record.id,
+        business_no=waste_no,
+        title=f"废液回收申请已提交，待安环检查: {chemical.name}",
+        summary=f"废液编号: {waste_no} | 数量: {record.quantity}{record.unit} | 容器: {record.container_no or '未指定'}",
+        lab_id=record.lab_id,
+        operator_id=current_user.id,
+        target_user_id=current_user.id,
+        handle_status=models.EventHandleStatus.PENDING,
+        detail_url=f"/waste/{record.id}",
+        extra_data={
+            "chemical_name": chemical.name,
+            "waste_type": record.waste_type,
+            "container_no": record.container_no,
+        },
+        emit_ws=False,
+    )
+    db.commit()
+    db.refresh(record)
+
     notification_service.create_notification(
         db=db,
         notification_type=models.NotificationType.WASTE,
@@ -139,6 +177,29 @@ def create_waste_record(
         lab_id=record.lab_id,
         related_id=record.id,
         related_type="waste"
+    )
+    dispatch_ws_event(
+        notification_type="waste",
+        event="submitted",
+        data={
+            "id": record.id,
+            "business_id": record.id,
+            "business_no": waste_no,
+            "waste_no": waste_no,
+            "chemical_id": record.chemical_id,
+            "chemical_name": chemical.name,
+            "lab_id": record.lab_id,
+            "waste_type": record.waste_type,
+            "quantity": record.quantity,
+            "unit": record.unit,
+            "container_no": record.container_no,
+            "container_type": record.container_type,
+            "submitter_id": current_user.id,
+            "status": "pending_inspection",
+        },
+        user_ids=[current_user.id],
+        lab_id=record.lab_id,
+        roles=[models.UserRole.SAFETY_OFFICER],
     )
 
     return schemas.WasteRecordResponse(
@@ -435,6 +496,76 @@ def create_waste_batch(
         related_id=batch.id,
         related_type="waste_batch"
     )
+    # 给每条废液写审计痕迹+事件，推送给各自实验室人员
+    for w in waste_records:
+        submitter_id = w.submitter_id
+        wait_duration = None
+        if w.inspected_at and w.created_at:
+            wait_duration = (w.inspected_at - w.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            business_id=w.id,
+            business_no=w.waste_no,
+            action="废液已归集入转运批次",
+            stage_name="入批→待发运",
+            from_status="inspection_passed",
+            to_status="batched",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=f"转运批次: {batch_no}",
+            duration_seconds=wait_duration,
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch_no,
+                "disposal_center_id": center.id,
+                "disposal_center_name": center.name,
+            },
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            event_type="batched",
+            business_id=w.id,
+            business_no=w.waste_no,
+            title=f"废液已归集入转运批次: {batch_no}",
+            summary=f"处理中心: {center.name} | 批次总量: {total_quantity} | 包含记录: {len(waste_records)}条",
+            lab_id=w.lab_id,
+            operator_id=current_user.id,
+            target_user_id=submitter_id,
+            handle_status=models.EventHandleStatus.HANDLING,
+            detail_url=f"/waste/{w.id}",
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch_no,
+                "disposal_center_name": center.name,
+            },
+            emit_ws=False,
+        )
+        dispatch_ws_event(
+            notification_type="waste",
+            event="batched",
+            data={
+                "id": w.id,
+                "business_id": w.id,
+                "business_no": w.waste_no,
+                "waste_no": w.waste_no,
+                "chemical_id": w.chemical_id,
+                "chemical_name": w.chemical.name if w.chemical else None,
+                "lab_id": w.lab_id,
+                "batch_id": batch.id,
+                "batch_no": batch_no,
+                "disposal_center_id": center.id,
+                "disposal_center_name": center.name,
+                "status": "batched",
+            },
+            user_ids=[submitter_id] if submitter_id else None,
+            lab_id=w.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER],
+        )
+    db.commit()
+    db.refresh(batch)
 
     return schemas.WasteBatchResponse(
         id=batch.id,
@@ -473,6 +604,267 @@ def create_waste_batch(
                 disposal_center_id=w.disposal_center_id,
                 created_at=w.created_at,
                 inspected_at=w.inspected_at
+            ) for w in waste_records
+        ]
+    )
+
+
+@router_waste.post("/batches/{batch_id}/ship", response_model=schemas.WasteBatchResponse)
+def ship_waste_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles(models.UserRole.SAFETY_OFFICER, models.UserRole.ADMIN))
+):
+    batch = db.query(models.WasteBatch).filter(models.WasteBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="转运批次不存在")
+    if batch.status == "in_transit":
+        raise HTTPException(status_code=400, detail="该批次已发运")
+    if batch.status == "received":
+        raise HTTPException(status_code=400, detail="该批次已接收完成")
+
+    batch.status = "in_transit"
+    batch.shipped_at = datetime.utcnow()
+    waste_records = db.query(models.WasteRecord).filter(models.WasteRecord.batch_id == batch.id).all()
+    for w in waste_records:
+        w.status = models.WasteStatus.IN_TRANSIT
+    db.flush()
+
+    # 每条废液写审计+事件+WS
+    center = db.query(models.DisposalCenter).filter(models.DisposalCenter.id == batch.disposal_center_id).first()
+    for w in waste_records:
+        wait_duration = None
+        if batch.shipped_at and w.created_at:
+            wait_duration = (batch.shipped_at - w.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            business_id=w.id,
+            business_no=w.waste_no,
+            action="转运批次已发运",
+            stage_name="待发运→运输中",
+            from_status="batched",
+            to_status="in_transit",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=f"批次号: {batch.batch_no}, 车辆: {batch.vehicle_plate or '未登记'}, 司机: {batch.driver_name or '未登记'}",
+            duration_seconds=wait_duration,
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "vehicle_plate": batch.vehicle_plate,
+                "driver_name": batch.driver_name,
+            },
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            event_type="shipped",
+            business_id=w.id,
+            business_no=w.waste_no,
+            title=f"废液转运批次已发运: {batch.batch_no}",
+            summary=f"处理中心: {center.name if center else '未指定'} | 车牌: {batch.vehicle_plate or '未登记'} | 司机: {batch.driver_name or '未登记'}",
+            lab_id=w.lab_id,
+            operator_id=current_user.id,
+            target_user_id=w.submitter_id,
+            handle_status=models.EventHandleStatus.HANDLING,
+            detail_url=f"/waste/{w.id}",
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "vehicle_plate": batch.vehicle_plate,
+            },
+            emit_ws=False,
+        )
+        dispatch_ws_event(
+            notification_type="waste",
+            event="shipped",
+            data={
+                "id": w.id,
+                "business_id": w.id,
+                "business_no": w.waste_no,
+                "waste_no": w.waste_no,
+                "lab_id": w.lab_id,
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "vehicle_plate": batch.vehicle_plate,
+                "driver_name": batch.driver_name,
+                "transport_company": batch.transport_company,
+                "status": "in_transit",
+            },
+            user_ids=[w.submitter_id] if w.submitter_id else None,
+            lab_id=w.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER],
+        )
+
+    notification_service.create_notification(
+        db=db,
+        notification_type=models.NotificationType.WASTE,
+        title=f"废液转运批次已发运: {batch.batch_no}",
+        content=f"车辆: {batch.vehicle_plate or '未登记'}, 司机: {batch.driver_name or '未登记'}, 共{len(waste_records)}条记录",
+        roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.ADMIN],
+        related_id=batch.id,
+        related_type="waste_batch",
+    )
+    db.commit()
+    db.refresh(batch)
+    waste_records = db.query(models.WasteRecord).filter(models.WasteRecord.batch_id == batch.id).all()
+    return schemas.WasteBatchResponse(
+        id=batch.id,
+        batch_no=batch.batch_no,
+        disposal_center_id=batch.disposal_center_id,
+        transport_company=batch.transport_company,
+        driver_name=batch.driver_name,
+        vehicle_plate=batch.vehicle_plate,
+        manifest_no=batch.manifest_no,
+        total_quantity=batch.total_quantity,
+        status=batch.status,
+        created_at=batch.created_at,
+        shipped_at=batch.shipped_at,
+        received_at=batch.received_at,
+        waste_records=[
+            schemas.WasteRecordResponse(
+                id=w.id, waste_no=w.waste_no, chemical_id=w.chemical_id,
+                chemical_name=w.chemical.name if w.chemical else None,
+                lab_id=w.lab_id, waste_type=w.waste_type, quantity=w.quantity,
+                unit=w.unit, container_no=w.container_no, container_type=w.container_type,
+                seal_inspection_passed=w.seal_inspection_passed,
+                seal_inspection_notes=w.seal_inspection_notes,
+                label_inspection_passed=w.label_inspection_passed,
+                label_inspection_notes=w.label_inspection_notes,
+                violation_recorded=w.violation_recorded, violation_type=w.violation_type,
+                violation_notes=w.violation_notes, status=w.status,
+                batch_id=w.batch_id, disposal_center_id=w.disposal_center_id,
+                created_at=w.created_at, inspected_at=w.inspected_at,
+            ) for w in waste_records
+        ]
+    )
+
+
+@router_waste.post("/batches/{batch_id}/receive", response_model=schemas.WasteBatchResponse)
+def receive_waste_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_roles(models.UserRole.SAFETY_OFFICER, models.UserRole.ADMIN))
+):
+    batch = db.query(models.WasteBatch).filter(models.WasteBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="转运批次不存在")
+    if batch.status != "in_transit":
+        raise HTTPException(status_code=400, detail="该批次未处于运输中状态")
+
+    batch.status = "received"
+    batch.received_at = datetime.utcnow()
+    waste_records = db.query(models.WasteRecord).filter(models.WasteRecord.batch_id == batch.id).all()
+    for w in waste_records:
+        w.status = models.WasteStatus.DISPOSED
+    db.flush()
+
+    center = db.query(models.DisposalCenter).filter(models.DisposalCenter.id == batch.disposal_center_id).first()
+    for w in waste_records:
+        duration = None
+        if batch.received_at and w.created_at:
+            duration = (batch.received_at - w.created_at).total_seconds()
+        event_service.add_audit_trail(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            business_id=w.id,
+            business_no=w.waste_no,
+            action="废液处理完成，流转闭环",
+            stage_name="运输中→已处置",
+            from_status="in_transit",
+            to_status="disposed",
+            operator_id=current_user.id,
+            operator_name=current_user.real_name,
+            operator_role=current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            comment=f"批次号: {batch.batch_no}, 处理中心: {center.name if center else '未指定'}",
+            duration_seconds=duration,
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "disposal_center_name": center.name if center else None,
+            },
+        )
+        event_service.log_event(
+            db=db,
+            business_type=models.EventBusinessType.WASTE,
+            event_type="disposed",
+            business_id=w.id,
+            business_no=w.waste_no,
+            title=f"废液已完成处置: {w.chemical.name if w.chemical else w.waste_no}",
+            summary=f"处理中心: {center.name if center else '未指定'} | 批次号: {batch.batch_no} | 总周期: {round(duration/3600,1)}小时" if duration else "",
+            lab_id=w.lab_id,
+            operator_id=current_user.id,
+            target_user_id=w.submitter_id,
+            handle_status=models.EventHandleStatus.COMPLETED,
+            detail_url=f"/waste/{w.id}",
+            extra_data={
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "total_duration_seconds": duration,
+            },
+            emit_ws=False,
+        )
+        dispatch_ws_event(
+            notification_type="waste",
+            event="disposed",
+            data={
+                "id": w.id,
+                "business_id": w.id,
+                "business_no": w.waste_no,
+                "waste_no": w.waste_no,
+                "lab_id": w.lab_id,
+                "batch_id": batch.id,
+                "batch_no": batch.batch_no,
+                "disposal_center_id": batch.disposal_center_id,
+                "disposal_center_name": center.name if center else None,
+                "status": "disposed",
+            },
+            user_ids=[w.submitter_id] if w.submitter_id else None,
+            lab_id=w.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER],
+        )
+
+    notification_service.create_notification(
+        db=db,
+        notification_type=models.NotificationType.WASTE,
+        title=f"废液转运批次已接收完成: {batch.batch_no}",
+        content=f"处理中心: {center.name if center else '未指定'}, 共{len(waste_records)}条废液记录",
+        roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.ADMIN],
+        related_id=batch.id,
+        related_type="waste_batch",
+    )
+    db.commit()
+    db.refresh(batch)
+    waste_records = db.query(models.WasteRecord).filter(models.WasteRecord.batch_id == batch.id).all()
+    return schemas.WasteBatchResponse(
+        id=batch.id,
+        batch_no=batch.batch_no,
+        disposal_center_id=batch.disposal_center_id,
+        transport_company=batch.transport_company,
+        driver_name=batch.driver_name,
+        vehicle_plate=batch.vehicle_plate,
+        manifest_no=batch.manifest_no,
+        total_quantity=batch.total_quantity,
+        status=batch.status,
+        created_at=batch.created_at,
+        shipped_at=batch.shipped_at,
+        received_at=batch.received_at,
+        waste_records=[
+            schemas.WasteRecordResponse(
+                id=w.id, waste_no=w.waste_no, chemical_id=w.chemical_id,
+                chemical_name=w.chemical.name if w.chemical else None,
+                lab_id=w.lab_id, waste_type=w.waste_type, quantity=w.quantity,
+                unit=w.unit, container_no=w.container_no, container_type=w.container_type,
+                seal_inspection_passed=w.seal_inspection_passed,
+                seal_inspection_notes=w.seal_inspection_notes,
+                label_inspection_passed=w.label_inspection_passed,
+                label_inspection_notes=w.label_inspection_notes,
+                violation_recorded=w.violation_recorded, violation_type=w.violation_type,
+                violation_notes=w.violation_notes, status=w.status,
+                batch_id=w.batch_id, disposal_center_id=w.disposal_center_id,
+                created_at=w.created_at, inspected_at=w.inspected_at,
             ) for w in waste_records
         ]
     )

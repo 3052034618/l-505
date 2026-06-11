@@ -254,6 +254,8 @@ def create_inbound(
             event="approved",
             data={
                 "id": record.id,
+                "business_id": record.id,
+                "business_no": inbound_in.batch_no,
                 "chemical_id": inbound_in.chemical_id,
                 "chemical_name": chemical.name,
                 "batch_no": inbound_in.batch_no,
@@ -318,6 +320,8 @@ def create_inbound(
             event="rejected",
             data={
                 "id": record.id,
+                "business_id": record.id,
+                "business_no": inbound_in.batch_no,
                 "chemical_id": inbound_in.chemical_id,
                 "chemical_name": chemical.name,
                 "batch_no": inbound_in.batch_no,

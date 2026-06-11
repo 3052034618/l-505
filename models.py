@@ -293,6 +293,9 @@ class UsageRequest(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     supervisor_reviewed_at = Column(DateTime)
     completed_at = Column(DateTime)
+    reminder_sent_count = Column(Integer, default=0)
+    last_reminder_sent_at = Column(DateTime)
+    reminder_level = Column(Integer, default=0)
 
     requester = relationship("User", foreign_keys=[requester_id], back_populates="submitted_requests")
     supervisor = relationship("User", foreign_keys=[supervisor_id], back_populates="approved_requests")
@@ -389,6 +392,9 @@ class AlarmTask(Base):
     assigned_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
+    reminder_sent_count = Column(Integer, default=0)
+    last_reminder_sent_at = Column(DateTime)
+    reminder_level = Column(Integer, default=0)
 
     alarm = relationship("Alarm", back_populates="tasks")
     assignee = relationship("User", back_populates="assigned_alarms")
@@ -430,6 +436,9 @@ class WasteRecord(Base):
     inspector_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     inspected_at = Column(DateTime)
+    reminder_sent_count = Column(Integer, default=0)
+    last_reminder_sent_at = Column(DateTime)
+    reminder_level = Column(Integer, default=0)
 
     chemical = relationship("Chemical", back_populates="waste_records")
     batch = relationship("WasteBatch", back_populates="waste_records")
@@ -505,6 +514,7 @@ class ReplenishmentRequest(Base):
     safety_officer_comment = Column(Text)
     reminder_sent_count = Column(Integer, default=0)
     last_reminder_sent_at = Column(DateTime)
+    reminder_level = Column(Integer, default=0)
     purchase_order_no = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
     lab_manager_approved_at = Column(DateTime)
