@@ -1,6 +1,8 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, Query
 from typing import Dict, Set, List, Optional
 import json
+import asyncio
+import threading
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
@@ -10,6 +12,31 @@ from jose import JWTError, jwt
 from config import settings
 
 router_ws = APIRouter(tags=["实时推送"])
+
+_ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
+_ws_loop_thread: Optional[threading.Thread] = None
+
+
+def _ensure_event_loop():
+    global _ws_event_loop, _ws_loop_thread
+    if _ws_event_loop is not None and _ws_event_loop.is_running():
+        return _ws_event_loop
+
+    def _run_loop():
+        global _ws_event_loop
+        _ws_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_ws_event_loop)
+        _ws_event_loop.run_forever()
+
+    if _ws_loop_thread is None or not _ws_loop_thread.is_alive():
+        _ws_loop_thread = threading.Thread(target=_run_loop, daemon=True, name="ws-dispatch")
+        _ws_loop_thread.start()
+        import time as _t
+        for _ in range(50):
+            if _ws_event_loop is not None:
+                break
+            _t.sleep(0.05)
+    return _ws_event_loop
 
 
 class ConnectionManager:
@@ -91,6 +118,7 @@ async def websocket_endpoint(
     token: str = Query(..., description="JWT access token"),
     db: Session = Depends(get_db)
 ):
+    _ensure_event_loop()
     user, lab_id, role = get_user_from_token(token, db)
     if not user:
         await websocket.close(code=1008, reason="Invalid or expired token")
@@ -156,3 +184,22 @@ async def push_notification(notification_type: str, event: str, data: dict, user
         await manager.send_to_lab(message, lab_id)
     if roles:
         await manager.send_to_roles(message, roles)
+
+
+def dispatch_ws_event(notification_type: str, event: str, data: dict,
+                      user_ids: Optional[List[int]] = None,
+                      lab_id: Optional[int] = None,
+                      roles: Optional[List] = None):
+    try:
+        loop = _ensure_event_loop()
+        if loop is None:
+            return
+        role_strs = [r.value if hasattr(r, 'value') else str(r) for r in (roles or [])]
+        user_id_ints = [int(uid) for uid in (user_ids or [])]
+        lab_int = int(lab_id) if lab_id is not None else None
+        asyncio.run_coroutine_threadsafe(
+            push_notification(notification_type, event, data, user_id_ints, lab_int, role_strs),
+            loop
+        )
+    except Exception:
+        pass

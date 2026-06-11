@@ -8,6 +8,8 @@ from notification_service import notification_service
 import models
 import schemas
 
+from routers.websocket import dispatch_ws_event
+
 router_inbound = APIRouter(prefix="/api/inbound", tags=["危化品入库"])
 
 
@@ -244,6 +246,22 @@ def create_inbound(
             related_id=record.id,
             related_type="inbound"
         )
+        dispatch_ws_event(
+            notification_type="inbound",
+            event="approved",
+            data={
+                "id": record.id,
+                "chemical_id": inbound_in.chemical_id,
+                "chemical_name": chemical.name,
+                "batch_no": inbound_in.batch_no,
+                "quantity": inbound_in.quantity,
+                "unit": inbound_in.unit,
+                "cabinet_no": cabinet_result.cabinet_no,
+                "status": "approved"
+            },
+            lab_id=chemical.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.RESEARCHER, models.UserRole.SUPERVISOR]
+        )
     else:
         admin_ids = [u.id for u in db.query(models.User).filter(
             models.User.role.in_([models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER]),
@@ -259,6 +277,20 @@ def create_inbound(
             related_type="inbound"
         )
         record.admin_notified = True
+        dispatch_ws_event(
+            notification_type="inbound",
+            event="rejected",
+            data={
+                "id": record.id,
+                "chemical_id": inbound_in.chemical_id,
+                "chemical_name": chemical.name,
+                "batch_no": inbound_in.batch_no,
+                "reject_reason": record.reject_reason,
+                "status": "rejected"
+            },
+            lab_id=chemical.lab_id,
+            roles=[models.UserRole.ADMIN, models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
+        )
 
     db.add(record)
     db.commit()

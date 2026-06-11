@@ -5,11 +5,82 @@ from datetime import datetime, timedelta
 from database import get_db
 from auth import get_current_user, require_roles, generate_request_no
 from notification_service import notification_service
+from routers.websocket import dispatch_ws_event
 import models
 import schemas
 
 router_waste = APIRouter(prefix="/api/waste", tags=["废液回收"])
 router_replenishment = APIRouter(prefix="/api/replenishment", tags=["库存补货"])
+
+
+import json as _json
+
+def _parse_waste_types_list(val):
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x) for x in val]
+    if isinstance(val, str):
+        try:
+            parsed = _json.loads(val)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+            return [str(val)]
+        except Exception:
+            return [str(val)]
+    return []
+
+
+def find_matching_disposal_center(db: Session, waste_type: str) -> Optional[models.DisposalCenter]:
+    centers = db.query(models.DisposalCenter).filter(models.DisposalCenter.is_active == True).all()
+    for center in centers:
+        allowed = _parse_waste_types_list(center.allowed_waste_types)
+        if not allowed or waste_type in allowed:
+            return center
+    return None
+
+
+def auto_create_batch_for_waste(db: Session, waste: models.WasteRecord, operator_id: int) -> Optional[models.WasteBatch]:
+    if waste.status != models.WasteStatus.INSPECTION_PASSED:
+        return None
+    if waste.batch_id is not None:
+        return None
+
+    center = find_matching_disposal_center(db, waste.waste_type)
+    if not center:
+        return None
+
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+    existing_batch = db.query(models.WasteBatch).filter(
+        models.WasteBatch.disposal_center_id == center.id,
+        models.WasteBatch.status == "created",
+        models.WasteBatch.created_at >= one_hour_ago
+    ).first()
+
+    if existing_batch:
+        waste.batch_id = existing_batch.id
+        waste.disposal_center_id = center.id
+        waste.status = models.WasteStatus.BATCHED
+        existing_batch.total_quantity = (existing_batch.total_quantity or 0) + waste.quantity
+        return existing_batch
+
+    batch_no = generate_request_no("WB")
+    batch = models.WasteBatch(
+        batch_no=batch_no,
+        disposal_center_id=center.id,
+        transport_company="系统自动调度",
+        total_quantity=waste.quantity,
+        status="created",
+        created_by_id=operator_id,
+        created_at=datetime.utcnow()
+    )
+    db.add(batch)
+    db.flush()
+
+    waste.batch_id = batch.id
+    waste.disposal_center_id = center.id
+    waste.status = models.WasteStatus.BATCHED
+    return batch
 
 
 def inspect_container_and_label(waste_record: models.WasteRecord, inspection: schemas.WasteInspectionResult, db: Session):
@@ -111,18 +182,46 @@ def inspect_waste(
     inspection = inspection_in.inspection_result
     passed = inspect_container_and_label(waste, inspection, db)
     waste.inspector_id = current_user.id
+
+    created_batch = None
+    if passed:
+        created_batch = auto_create_batch_for_waste(db, waste, current_user.id)
+
     db.commit()
     db.refresh(waste)
 
     if passed:
+        batch_msg = f", 转运批次: {created_batch.batch_no}" if created_batch else ", 暂无匹配处理中心，等待调度"
         notification_service.create_notification(
             db=db,
             notification_type=models.NotificationType.WASTE,
             title=f"废液检查通过，待转运",
-            content=f"废液编号: {waste.waste_no}, 化学品: {waste.chemical.name if waste.chemical else ''}",
+            content=f"废液编号: {waste.waste_no}, 化学品: {waste.chemical.name if waste.chemical else ''}{batch_msg}",
             user_ids=[waste.submitter_id],
+            roles=[models.UserRole.SAFETY_OFFICER],
             related_id=waste.id,
             related_type="waste"
+        )
+        dispatch_ws_event(
+            notification_type="waste",
+            event="inspection_passed",
+            data={
+                "id": waste.id,
+                "waste_no": waste.waste_no,
+                "chemical_id": waste.chemical_id,
+                "chemical_name": waste.chemical.name if waste.chemical else None,
+                "lab_id": waste.lab_id,
+                "waste_type": waste.waste_type,
+                "quantity": waste.quantity,
+                "unit": waste.unit,
+                "batch_id": waste.batch_id,
+                "batch_no": created_batch.batch_no if created_batch else None,
+                "disposal_center_id": waste.disposal_center_id,
+                "status": "inspection_passed"
+            },
+            user_ids=[waste.submitter_id, current_user.id],
+            lab_id=waste.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
         )
     else:
         reasons = []
@@ -141,6 +240,29 @@ def inspect_waste(
             user_ids=[waste.submitter_id],
             related_id=waste.id,
             related_type="waste"
+        )
+        dispatch_ws_event(
+            notification_type="waste",
+            event="inspection_failed",
+            data={
+                "id": waste.id,
+                "waste_no": waste.waste_no,
+                "chemical_id": waste.chemical_id,
+                "chemical_name": waste.chemical.name if waste.chemical else None,
+                "lab_id": waste.lab_id,
+                "waste_type": waste.waste_type,
+                "quantity": waste.quantity,
+                "unit": waste.unit,
+                "reject_reasons": reasons,
+                "seal_passed": inspection.seal_passed,
+                "label_passed": inspection.label_passed,
+                "violation_recorded": inspection.violation_recorded,
+                "violation_type": inspection.violation_type,
+                "status": "inspection_failed"
+            },
+            user_ids=[waste.submitter_id, current_user.id],
+            lab_id=waste.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
         )
 
     chemical = waste.chemical
@@ -381,6 +503,65 @@ def list_disposal_centers(
     return db.query(models.DisposalCenter).filter(models.DisposalCenter.is_active == True).offset(skip).limit(limit).all()
 
 
+def auto_generate_single_replenishment(db: Session, chemical_id: int, created_by_id: Optional[int] = None) -> Optional[models.ReplenishmentRequest]:
+    chemical = db.query(models.Chemical).filter(models.Chemical.id == chemical_id).first()
+    if not chemical:
+        return None
+
+    existing = db.query(models.ReplenishmentRequest).filter(
+        models.ReplenishmentRequest.chemical_id == chemical_id,
+        models.ReplenishmentRequest.status.in_([
+            models.ReplenishmentStatus.PENDING_LAB_MANAGER,
+            models.ReplenishmentStatus.LAB_MANAGER_APPROVED,
+            models.ReplenishmentStatus.PENDING_SAFETY,
+            models.ReplenishmentStatus.SYNCED_TO_PURCHASE
+        ])
+    ).first()
+    if existing:
+        return None
+
+    inventories = db.query(models.Inventory).filter(models.Inventory.chemical_id == chemical_id).all()
+    if not inventories:
+        return None
+
+    current_total = sum(inv.current_quantity for inv in inventories)
+    safety_total = sum(inv.safety_level for inv in inventories)
+
+    if current_total > safety_total:
+        return None
+
+    suggested_qty = max(safety_total * 2, safety_total * 1.5)
+    request_no = generate_request_no("RP")
+    unit = inventories[0].unit
+
+    request = models.ReplenishmentRequest(
+        request_no=request_no,
+        chemical_id=chemical_id,
+        current_quantity=round(current_total, 4),
+        safety_level=round(safety_total, 4),
+        requested_quantity=round(suggested_qty, 2),
+        unit=unit,
+        reason=f"系统自动生成：领用扣减后库存低于安全水位 (当前: {round(current_total,4)}{unit}, 安全: {round(safety_total,4)}{unit})",
+        status=models.ReplenishmentStatus.PENDING_LAB_MANAGER,
+        created_by_id=created_by_id,
+        created_at=datetime.utcnow()
+    )
+    db.add(request)
+    db.flush()
+
+    notification_service.create_notification(
+        db=db,
+        notification_type=models.NotificationType.REPLENISHMENT,
+        title=f"系统自动生成补货申请: {chemical.name}",
+        content=f"申请单号: {request_no}, 当前库存: {round(current_total,4)}{unit}, 建议补货: {round(suggested_qty,2)}{unit}",
+        roles=[models.UserRole.LAB_MANAGER],
+        lab_id=chemical.lab_id,
+        related_id=request.id,
+        related_type="replenishment"
+    )
+    return request
+
+
 @router_replenishment.post("", response_model=schemas.ReplenishmentResponse)
 def create_replenishment(
     chemical_id: int,
@@ -573,6 +754,26 @@ def lab_manager_review(
             related_id=request.id,
             related_type="replenishment"
         )
+        dispatch_ws_event(
+            notification_type="replenishment",
+            event="lab_manager_approved",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "current_quantity": request.current_quantity,
+                "safety_level": request.safety_level,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "reviewer_id": current_user.id,
+                "reviewer_name": current_user.real_name,
+                "review_comment": review_in.comment,
+                "status": "pending_safety"
+            },
+            user_ids=[request.created_by_id, current_user.id],
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
+        )
     else:
         request.status = models.ReplenishmentStatus.LAB_MANAGER_REJECTED
         notification_service.create_notification(
@@ -583,6 +784,26 @@ def lab_manager_review(
             user_ids=[request.created_by_id],
             related_id=request.id,
             related_type="replenishment"
+        )
+        dispatch_ws_event(
+            notification_type="replenishment",
+            event="lab_manager_rejected",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "current_quantity": request.current_quantity,
+                "safety_level": request.safety_level,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "reviewer_id": current_user.id,
+                "reviewer_name": current_user.real_name,
+                "reject_reason": review_in.comment or "未说明",
+                "status": "lab_manager_rejected"
+            },
+            user_ids=[request.created_by_id, current_user.id],
+            roles=[models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
         )
 
     db.commit()
@@ -643,6 +864,27 @@ def safety_officer_review(
             related_id=request.id,
             related_type="replenishment"
         )
+        dispatch_ws_event(
+            notification_type="replenishment",
+            event="safety_approved",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "current_quantity": request.current_quantity,
+                "safety_level": request.safety_level,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "reviewer_id": current_user.id,
+                "reviewer_name": current_user.real_name,
+                "review_comment": review_in.comment,
+                "purchase_order_no": po_no,
+                "status": "synced_to_purchase"
+            },
+            user_ids=[request.created_by_id, current_user.id],
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
+        )
     else:
         request.status = models.ReplenishmentStatus.SAFETY_REJECTED
         notification_service.create_notification(
@@ -653,6 +895,26 @@ def safety_officer_review(
             user_ids=[request.created_by_id],
             related_id=request.id,
             related_type="replenishment"
+        )
+        dispatch_ws_event(
+            notification_type="replenishment",
+            event="safety_rejected",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "current_quantity": request.current_quantity,
+                "safety_level": request.safety_level,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "reviewer_id": current_user.id,
+                "reviewer_name": current_user.real_name,
+                "reject_reason": review_in.comment or "未说明",
+                "status": "safety_rejected"
+            },
+            user_ids=[request.created_by_id, current_user.id],
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.ADMIN]
         )
 
     db.commit()

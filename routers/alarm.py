@@ -8,6 +8,8 @@ from notification_service import notification_service
 import models
 import schemas
 
+from routers.websocket import dispatch_ws_event
+
 router_sensors = APIRouter(prefix="/api/sensors", tags=["传感器管理"])
 router_alarms = APIRouter(prefix="/api/alarms", tags=["告警与应急调度"])
 
@@ -307,6 +309,46 @@ def trigger_alarm_from_sensor(db: Session, sensor: models.Sensor, value: float, 
         lab_id=lab_id,
         related_id=alarm.id,
         related_type="alarm"
+    )
+
+    task_list = []
+    for t in tasks:
+        task_list.append({
+            "id": t.id,
+            "assignee_id": t.assignee_id,
+            "assignee_name": t.assignee.real_name if hasattr(t, 'assignee') and t.assignee else None,
+            "task_description": t.task_description,
+            "priority": t.priority,
+            "status": t.status.value if hasattr(t.status, 'value') else str(t.status)
+        })
+
+    dispatch_ws_event(
+        notification_type="alarm",
+        event="triggered",
+        data={
+            "id": alarm.id,
+            "alarm_no": alarm.alarm_no,
+            "level": alarm_level.value if hasattr(alarm_level, 'value') else str(alarm_level),
+            "level_name": level_name,
+            "type": alarm_type,
+            "sensor_id": sensor.id,
+            "sensor_no": sensor.sensor_no,
+            "lab_id": lab_id,
+            "cabinet_id": cabinet_id,
+            "location": sensor.location,
+            "trigger_value": value,
+            "threshold_value": sensor.threshold_max or sensor.threshold_min,
+            "unit": unit,
+            "chemical_category": chemical_category,
+            "personnel_density": personnel_density,
+            "emergency_plan_id": plan.id if plan else None,
+            "emergency_plan_name": plan.name if plan else None,
+            "tasks": task_list,
+            "description": alarm.description,
+            "status": "triggered"
+        },
+        lab_id=lab_id,
+        roles=roles_to_notify + [models.UserRole.SUPERVISOR, models.UserRole.RESEARCHER]
     )
 
     return alarm.id

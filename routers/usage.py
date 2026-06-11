@@ -8,6 +8,9 @@ from notification_service import notification_service
 import models
 import schemas
 
+from routers.waste import auto_generate_single_replenishment
+from routers.websocket import dispatch_ws_event
+
 router_usage = APIRouter(prefix="/api/usage", tags=["领用申请"])
 
 
@@ -189,32 +192,37 @@ def create_usage_request(
     needs_supervisor = False
     block_reason = None
     alt_suggestion_text = None
+    hard_rejected = False
 
     if not qualification_result.passed:
         auto_passed = False
+        hard_rejected = True
         block_reason = " | ".join(qualification_result.issues)
 
     if not permission_ok:
         auto_passed = False
+        needs_supervisor = True
         block_reason = (block_reason + " | " if block_reason else "") + permission_msg
         if alternatives:
             alt_suggestion_text = "; ".join([f"{s.chemical_name}: {s.reason}" for s in alternatives])
 
-    if not deviation_result.passed or deviation_result.deviation_ratio and deviation_result.deviation_ratio > 2.0:
+    if not deviation_result.passed or (deviation_result.deviation_ratio and deviation_result.deviation_ratio > 2.0):
         needs_supervisor = True
-        if auto_passed and not block_reason:
+        if not block_reason:
             block_reason = deviation_result.message
+        elif deviation_result.message and deviation_result.message not in block_reason:
+            block_reason = block_reason + " | " + deviation_result.message
 
     if alternatives and (chemical.hazard_level in [models.HazardLevel.HIGH, models.HazardLevel.EXTREME]):
         if not alt_suggestion_text:
             alt_suggestion_text = "; ".join([f"{s.chemical_name}: {s.reason}" for s in alternatives])
 
-    if auto_passed and not needs_supervisor:
-        status_val = models.RequestStatus.AUTO_APPROVED
-    elif auto_passed and needs_supervisor:
+    if hard_rejected:
+        status_val = models.RequestStatus.AUTO_REJECTED
+    elif needs_supervisor:
         status_val = models.RequestStatus.SUPERVISOR_PENDING
     else:
-        status_val = models.RequestStatus.AUTO_REJECTED
+        status_val = models.RequestStatus.AUTO_APPROVED
 
     auto_review_details = schemas.AutoReviewResult(
         passed=auto_passed,
@@ -275,6 +283,8 @@ def create_usage_request(
         request.completed_at = datetime.utcnow()
         request.actual_quantity = request_in.requested_quantity
 
+        auto_generate_single_replenishment(db, request_in.chemical_id, current_user.id)
+
         notification_service.create_notification(
             db=db,
             notification_type=models.NotificationType.USAGE_REQUEST,
@@ -283,6 +293,24 @@ def create_usage_request(
             user_ids=[current_user.id],
             related_id=request.id,
             related_type="usage_request"
+        )
+        dispatch_ws_event(
+            notification_type="usage",
+            event="completed",
+            data={
+                "id": request.id,
+                "request_no": request_no,
+                "requester_id": current_user.id,
+                "requester_name": current_user.real_name,
+                "chemical_id": request_in.chemical_id,
+                "chemical_name": chemical.name,
+                "requested_quantity": request_in.requested_quantity,
+                "unit": request_in.unit,
+                "status": "completed"
+            },
+            user_ids=[current_user.id],
+            lab_id=request_in.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
         )
 
     elif status_val == models.RequestStatus.SUPERVISOR_PENDING:
@@ -304,6 +332,25 @@ def create_usage_request(
             related_id=request.id,
             related_type="usage_request"
         )
+        dispatch_ws_event(
+            notification_type="usage",
+            event="supervisor_pending",
+            data={
+                "id": request.id,
+                "request_no": request_no,
+                "requester_id": current_user.id,
+                "requester_name": current_user.real_name,
+                "chemical_id": request_in.chemical_id,
+                "chemical_name": chemical.name,
+                "requested_quantity": request_in.requested_quantity,
+                "unit": request_in.unit,
+                "block_reason": block_reason or deviation_result.message,
+                "status": "supervisor_pending"
+            },
+            user_ids=[current_user.id],
+            lab_id=request_in.lab_id,
+            roles=[models.UserRole.SUPERVISOR, models.UserRole.LAB_MANAGER]
+        )
     else:
         notification_service.create_notification(
             db=db,
@@ -313,6 +360,26 @@ def create_usage_request(
             user_ids=[current_user.id],
             related_id=request.id,
             related_type="usage_request"
+        )
+        dispatch_ws_event(
+            notification_type="usage",
+            event="auto_rejected",
+            data={
+                "id": request.id,
+                "request_no": request_no,
+                "requester_id": current_user.id,
+                "requester_name": current_user.real_name,
+                "chemical_id": request_in.chemical_id,
+                "chemical_name": chemical.name,
+                "requested_quantity": request_in.requested_quantity,
+                "unit": request_in.unit,
+                "block_reason": block_reason or "系统自动拦截",
+                "alternative_suggestion": alt_suggestion_text,
+                "status": "auto_rejected"
+            },
+            user_ids=[current_user.id],
+            lab_id=request_in.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER]
         )
 
     db.commit()
@@ -439,6 +506,8 @@ def review_usage_request(
         request.completed_at = datetime.utcnow()
         request.actual_quantity = request.requested_quantity
 
+        auto_generate_single_replenishment(db, request.chemical_id, current_user.id)
+
         notification_service.create_notification(
             db=db,
             notification_type=models.NotificationType.USAGE_REQUEST,
@@ -447,6 +516,28 @@ def review_usage_request(
             user_ids=[request.requester_id],
             related_id=request.id,
             related_type="usage_request"
+        )
+        dispatch_ws_event(
+            notification_type="usage",
+            event="supervisor_approved",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "requester_id": request.requester_id,
+                "requester_name": request.requester.real_name if request.requester else None,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "actual_quantity": request.actual_quantity,
+                "supervisor_id": current_user.id,
+                "supervisor_name": current_user.real_name,
+                "review_comment": review_in.comment,
+                "status": "supervisor_approved"
+            },
+            user_ids=[request.requester_id, current_user.id],
+            lab_id=request.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
         )
     else:
         request.status = models.RequestStatus.SUPERVISOR_REJECTED
@@ -458,6 +549,27 @@ def review_usage_request(
             user_ids=[request.requester_id],
             related_id=request.id,
             related_type="usage_request"
+        )
+        dispatch_ws_event(
+            notification_type="usage",
+            event="supervisor_rejected",
+            data={
+                "id": request.id,
+                "request_no": request.request_no,
+                "requester_id": request.requester_id,
+                "requester_name": request.requester.real_name if request.requester else None,
+                "chemical_id": request.chemical_id,
+                "chemical_name": request.chemical.name if request.chemical else None,
+                "requested_quantity": request.requested_quantity,
+                "unit": request.unit,
+                "supervisor_id": current_user.id,
+                "supervisor_name": current_user.real_name,
+                "reject_reason": review_in.comment or "未给出具体原因",
+                "status": "supervisor_rejected"
+            },
+            user_ids=[request.requester_id, current_user.id],
+            lab_id=request.lab_id,
+            roles=[models.UserRole.SAFETY_OFFICER, models.UserRole.LAB_MANAGER, models.UserRole.SUPERVISOR]
         )
 
     db.commit()
